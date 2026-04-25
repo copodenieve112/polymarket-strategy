@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+from clock import now_utc
 from models import Market
 from strategy import TradeSignal, calc_fee, evaluate
 
@@ -51,8 +52,7 @@ class Trade:
 
     @property
     def seconds_since_close(self) -> float:
-        now = datetime.utcnow()
-        return (now - self.end_time).total_seconds()
+        return (now_utc() - self.end_time).total_seconds()
 
 
 @dataclass
@@ -116,7 +116,7 @@ class Portfolio:
         if not self.started_at:
             return 0.0
         start = datetime.fromisoformat(self.started_at)
-        return (datetime.utcnow() - start).total_seconds() / 3600
+        return (now_utc() - start).total_seconds() / 3600
 
     @property
     def is_demo_finished(self) -> bool:
@@ -162,12 +162,12 @@ class DemoEngine:
                 return p
             except Exception:
                 pass
-        p = Portfolio(started_at=datetime.utcnow().isoformat())
+        p = Portfolio(started_at=now_utc().isoformat())
         self._save(p)
         return p
 
     def _save(self, p: Portfolio):
-        p.last_updated = datetime.utcnow().isoformat()
+        p.last_updated = now_utc().isoformat()
         data = {
             "capital":      p.capital,
             "started_at":   p.started_at,
@@ -232,18 +232,35 @@ class DemoEngine:
                     continue
 
                 for m in event.get("markets", []):
-                    # Resolución: lastTradePrice ≈ 1 (YES ganó) ó ≈ 0 (NO ganó)
+                    # outcomePrices es la fuente canónica de resolución
+                    op_raw = m.get("outcomePrices", [])
+                    if isinstance(op_raw, str):
+                        try:
+                            op_raw = json.loads(op_raw)
+                        except Exception:
+                            op_raw = []
+                    if len(op_raw) >= 2:
+                        op_yes = float(op_raw[0])
+                        if op_yes >= 0.99:
+                            return 1.0  # YES ganó
+                        if op_yes <= 0.01:
+                            return 0.0  # NO ganó
+
+                    # Fallback: lastTradePrice exactamente en 0 ó 1
                     last = m.get("lastTradePrice")
-                    best_ask = m.get("bestAsk") or m.get("ask")
                     if last is not None and float(last) in (0.0, 1.0):
                         return float(last)
-                    # Algunos mercados solo tienen bestAsk en 0.01 ó 0.99
+
+                    # Fallback: bestAsk del token YES
+                    # ask bajo → YES barato → YES resolvió a 0 (NO ganó)
+                    # ask alto → YES caro  → YES resolvió a 1 (YES ganó)
+                    best_ask = m.get("bestAsk") or m.get("ask")
                     if best_ask is not None:
                         a = float(best_ask)
                         if a <= 0.02:
-                            return 1.0  # YES ganó (ask muy bajo → precio YES ≈ 1)
+                            return 0.0  # YES token vale casi 0 → NO ganó
                         if a >= 0.98:
-                            return 0.0  # NO ganó (ask muy alto → precio YES ≈ 0)
+                            return 1.0  # YES token vale casi 1 → YES ganó
         except Exception:
             pass
         return None
@@ -267,7 +284,7 @@ class DemoEngine:
         trade.fee_exit    = fee_exit
         trade.pnl         = round(pnl, 4)
         trade.status      = "won" if pnl > 0 else "lost"
-        trade.resolved_at = datetime.utcnow().isoformat()
+        trade.resolved_at = now_utc().isoformat()
 
         self._log(
             market=trade.question,
@@ -307,7 +324,7 @@ class DemoEngine:
 
         trade = Trade(
             id=str(uuid.uuid4())[:8],
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=now_utc().isoformat(),
             coin=market.coin,
             window=market.window_label,
             question=market.question,
@@ -337,7 +354,7 @@ class DemoEngine:
 
     def _log(self, market: str, action: str, detail: str):
         self.portfolio.decision_log.append({
-            "time":   datetime.utcnow().strftime("%H:%M:%S"),
+            "time":   now_utc().strftime("%H:%M:%S"),
             "market": market,
             "action": action,
             "detail": detail,
@@ -346,7 +363,7 @@ class DemoEngine:
     def reset(self):
         """Reinicia el demo desde cero."""
         STATE_FILE.unlink(missing_ok=True)
-        self.portfolio = Portfolio(started_at=datetime.utcnow().isoformat())
+        self.portfolio = Portfolio(started_at=now_utc().isoformat())
         self._save(self.portfolio)
 
 
