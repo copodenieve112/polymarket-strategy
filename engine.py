@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from clock import now_utc
 from models import Market
-from strategy import TradeSignal, calc_fee, evaluate
+from strategy import TradeSignal, calc_fee, evaluate, should_exit_early, LOSS_STREAK_COOLDOWN, COOLDOWN_CYCLES
 
 warnings.filterwarnings("ignore")
 
@@ -20,6 +20,7 @@ INITIAL_CAP   = 1000.0
 MAX_RUNTIME_H = 24
 MAX_TRADES    = 50
 RESOLVE_DELAY = 45   # segundos tras cierre antes de consultar resolución
+MAX_HISTORY   = 30   # precio history bars por mercado
 
 
 # ── Modelos de datos ──────────────────────────────────────────────────────────
@@ -45,6 +46,9 @@ class Trade:
     pnl:             float      = 0.0
     resolved_at:     str        = ""
     signal_reason:   str        = ""
+    signal_score:    float      = 0.0
+    kelly_f:         float      = 0.0
+    p_est:           float      = 0.0
 
     @property
     def end_time(self) -> datetime:
@@ -144,7 +148,10 @@ class DemoEngine:
     """
 
     def __init__(self):
-        self.portfolio = self._load_state()
+        self.portfolio        = self._load_state()
+        self.price_history:   dict  = {}  # key="COIN_TF" → List[float]
+        self.cooldown_cycles: int   = 0   # cycles remaining in loss cooldown
+        self._prev_loss_count: int  = 0   # track consecutive losses
 
     # ── Estado persistente ────────────────────────────────────────────────────
 
@@ -182,16 +189,47 @@ class DemoEngine:
     def run_cycle(self, markets: List[Market]):
         """
         Llamar en cada refresh (cada 5s):
-        1. Resuelve trades abiertos cuyo mercado ya cerró.
-        2. Evalúa nuevas oportunidades.
-        3. Guarda estado.
+        1. Actualiza price history.
+        2. Resuelve trades abiertos cuyo mercado ya cerró.
+        3. Comprueba salidas anticipadas.
+        4. Evalúa nuevas oportunidades.
+        5. Gestiona cooldown por rachas de pérdidas.
+        6. Guarda estado.
         """
         if self.portfolio.is_demo_finished:
             return
 
+        self._update_price_history(markets)
         self._resolve_open_trades()
+        self._check_early_exits(markets)
+        self._update_cooldown()
         self._evaluate_opportunities(markets)
         self._save(self.portfolio)
+
+    def _update_price_history(self, markets: List[Market]):
+        for m in markets:
+            key = f"{m.coin}_{m.window_label}"
+            hist = self.price_history.get(key, [])
+            hist.append(round(m.price_yes, 4))
+            self.price_history[key] = hist[-MAX_HISTORY:]
+
+    def _update_cooldown(self):
+        """Activate cooldown if loss streak exceeds threshold."""
+        closed = self.portfolio.closed_trades
+        if not closed:
+            return
+        # Count consecutive losses from the end
+        streak = 0
+        for t in reversed(closed):
+            if t.status == "lost":
+                streak += 1
+            else:
+                break
+        if streak >= LOSS_STREAK_COOLDOWN and self.cooldown_cycles == 0:
+            self.cooldown_cycles = COOLDOWN_CYCLES
+            self._log("ENGINE", "COOLDOWN", f"Racha de {streak} pérdidas → pausa {COOLDOWN_CYCLES} ciclos")
+        elif self.cooldown_cycles > 0:
+            self.cooldown_cycles -= 1
 
     # ── Resolución de trades ──────────────────────────────────────────────────
 
@@ -295,23 +333,88 @@ class DemoEngine:
             ),
         )
 
+    # ── Early exit check ──────────────────────────────────────────────────────
+
+    def _check_early_exits(self, markets: List[Market]):
+        """For each open trade, check stop-loss / take-profit / time-based exit."""
+        mkt_by_q = {m.question: m for m in markets}
+
+        for trade in list(self.portfolio.open_trades):
+            m = mkt_by_q.get(trade.question)
+            if m is None:
+                continue
+
+            cur_price = m.price_yes if trade.direction == "YES" else m.price_no
+            secs_left = m.time_left_seconds
+
+            exit_now, exit_reason = should_exit_early(
+                trade.entry_price, cur_price, secs_left, trade.window
+            )
+
+            if exit_now:
+                self._close_trade_early(trade, cur_price, exit_reason)
+
+    def _close_trade_early(self, trade, exit_price: float, reason: str):
+        """Close a trade early at current market price (simulated market order)."""
+        fee_exit = calc_fee(trade.shares, exit_price)
+        gross    = (exit_price - trade.entry_price) * trade.shares
+        pnl      = gross - trade.fee_entry - fee_exit
+
+        trade.exit_price  = exit_price
+        trade.fee_exit    = fee_exit
+        trade.pnl         = round(pnl, 4)
+        trade.status      = "won" if pnl > 0 else "lost"
+        trade.resolved_at = now_utc().isoformat()
+
+        self._log(
+            market=trade.question,
+            action="EXIT_EARLY",
+            detail=f"{reason} | exit={exit_price:.3f} | PnL=${pnl:+.2f} | {trade.status}",
+        )
+
     # ── Evaluación de nuevas oportunidades ────────────────────────────────────
 
     def _evaluate_opportunities(self, markets: List[Market]):
         already_trading = {t.question for t in self.portfolio.open_trades}
 
+        # Build lookup: (coin, tf) → market
+        mkt_map: dict = {(m.coin, m.window_label): m for m in markets}
+
         for market in markets:
             if market.question in already_trading:
                 continue
 
+            coin = market.coin
+            tf   = market.window_label
+
+            # Retrieve related timeframe markets for multi-TF signal
+            mkt_15m = mkt_map.get((coin, "15m")) if tf != "15m" else None
+            mkt_1h  = mkt_map.get((coin, "1h"))  if tf != "1h"  else None
+
+            # For 15m markets, use 1h as the only higher-TF reference
+            if tf == "15m":
+                mkt_15m = None
+
+            # For 1h markets, no higher TF available; 15m as lower confirmation
+            if tf == "1h":
+                mkt_15m = mkt_map.get((coin, "15m"))
+                mkt_1h  = None
+
+            key      = f"{coin}_{tf}"
+            price_hist = self.price_history.get(key, [])
+
             signal = evaluate(
-                market,
+                market=market,
+                mkt_15m=mkt_15m,
+                mkt_1h=mkt_1h,
+                price_hist=price_hist,
                 open_positions=len(self.portfolio.open_trades),
                 capital=self.portfolio.current_capital,
+                cooldown_remaining=self.cooldown_cycles,
             )
 
             self._log(
-                market=f"{market.coin} {market.window_label}",
+                market=f"{coin} {tf}",
                 action="EXECUTE" if signal.execute else "SKIP",
                 detail=signal.reason,
             )
@@ -338,6 +441,9 @@ class DemoEngine:
             end_time_iso=market.end_time.isoformat() if market.end_time else "",
             status="open",
             signal_reason=signal.reason,
+            signal_score=signal.signal_score,
+            kelly_f=signal.kelly_f,
+            p_est=signal.p_est,
         )
         self.portfolio.trades.append(trade)
         self._log(
@@ -363,7 +469,9 @@ class DemoEngine:
     def reset(self):
         """Reinicia el demo desde cero."""
         STATE_FILE.unlink(missing_ok=True)
-        self.portfolio = Portfolio(started_at=now_utc().isoformat())
+        self.portfolio        = Portfolio(started_at=now_utc().isoformat())
+        self.price_history    = {}
+        self.cooldown_cycles  = 0
         self._save(self.portfolio)
 
 

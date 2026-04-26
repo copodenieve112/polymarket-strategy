@@ -23,9 +23,13 @@ class Market:
     has_real_price: bool = False
     last_fetched_ms: int = 0
     updated_at_ms: int = 0
+    bid: float = 0.0
+    ask: float = 0.0
 
     @property
     def spread(self) -> float:
+        if self.bid > 0 and self.ask > 0:
+            return self.ask - self.bid
         return abs(self.price_yes + self.price_no - 1)
 
     @property

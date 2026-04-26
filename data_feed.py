@@ -180,6 +180,8 @@ def _parse_market(raw: dict, ticker: str, window_min: int, end_time: datetime) -
             has_real_price=has_real_price,
             last_fetched_ms=int(now_utc().timestamp() * 1000),
             updated_at_ms=updated_at_ms,
+            bid=bid,
+            ask=ask,
         )
 
         if abs(price_yes - 0.5) < 0.001:
