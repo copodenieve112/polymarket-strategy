@@ -5,6 +5,7 @@ warnings.filterwarnings("ignore")
 
 import json
 import math
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -14,19 +15,37 @@ from clock import now_utc
 from config import POLYMARKET_EVENTS_URL, REQUEST_TIMEOUT, SERIES, DEBUG_MODE
 from models import Market
 
+# Métricas de conexión accesibles desde el dashboard
+last_fetch_latency_ms: float = 0.0   # latencia del último ciclo completo
+last_fetch_errors:     int   = 0     # errores en el último ciclo
+last_fetch_ts:         float = 0.0   # timestamp unix del último fetch
+
 
 def fetch_markets() -> List[Market]:
     """Fetches the nearest future market for every (coin, window) in SERIES."""
+    global last_fetch_latency_ms, last_fetch_errors, last_fetch_ts
+
     markets: List[Market] = []
+    errors = 0
+    t0 = time.perf_counter()
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {
             executor.submit(_fetch_series, slug, ticker, window_min): (ticker, window_min)
             for slug, ticker, window_min in SERIES
         }
         for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                markets.append(result)
+            try:
+                result = future.result()
+                if result is not None:
+                    markets.append(result)
+            except Exception:
+                errors += 1
+
+    last_fetch_latency_ms = (time.perf_counter() - t0) * 1000
+    last_fetch_errors     = errors
+    last_fetch_ts         = time.time()
+
     markets.sort(key=lambda m: m.time_left_seconds)
     return markets
 
@@ -182,6 +201,7 @@ def _parse_market(raw: dict, ticker: str, window_min: int, end_time: datetime) -
             updated_at_ms=updated_at_ms,
             bid=bid,
             ask=ask,
+            last_trade_price=last,
         )
 
         if abs(price_yes - 0.5) < 0.001:

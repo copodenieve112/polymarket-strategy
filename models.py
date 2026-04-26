@@ -25,6 +25,7 @@ class Market:
     updated_at_ms: int = 0
     bid: float = 0.0
     ask: float = 0.0
+    last_trade_price: float = 0.0
 
     @property
     def spread(self) -> float:
